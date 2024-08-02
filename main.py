@@ -47,6 +47,24 @@ def init_user_data(user_id, username):
         db.execute_query("INSERT INTO users (user_id, username, status, last_request_time) VALUES (?, ?, ?, ?)",
                          (user_id, username, 'pending', None))
 
+def add_role(user_id, role):
+    user = db.fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
+    if user:
+        roles = user[0]
+        if role not in roles:
+            roles += f",{role}"
+            db.execute_query("UPDATE users SET roles = ? WHERE user_id = ?", (roles, user_id))
+    else:
+        db.execute_query("INSERT INTO users (user_id, roles) VALUES (?, ?)", (user_id, role))
+
+def remove_role(user_id, role):
+    user = db.fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
+    if user:
+        roles = user[0].split(',')
+        if role in roles:
+            roles.remove(role)
+            db.execute_query("UPDATE users SET roles = ? WHERE user_id = ?", (','.join(roles), user_id))
+
 # Приветствие и старт
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -54,7 +72,7 @@ def send_welcome(message):
     username = message.from_user.username
     
     if str(user_id) == config.ADMIN_ID:
-        show_main_menu(message)
+        show_admin_main_menu(message)
         return
 
     init_user_data(user_id, username)
@@ -148,6 +166,88 @@ def show_main_menu(message):
     btn4 = types.KeyboardButton('⏹️ Закончить работу')
     markup.add(btn1, btn2, btn3, btn4)
     bot.send_message(message.chat.id, "🚀 Работа начата!\n\nВыберите действие ниже.", reply_markup=markup)
+
+# Главное меню для администратора
+def show_admin_main_menu(message):
+    markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
+    btn1 = types.KeyboardButton('➕ Добавить номера')
+    btn2 = types.KeyboardButton('📊 Профиль')
+    btn3 = types.KeyboardButton('📋 Добавленные номера')
+    btn4 = types.KeyboardButton('⏹️ Закончить работу')
+    btn5 = types.KeyboardButton('🔧 Войти в админ панель')  # Новая кнопка для админ панели
+    markup.add(btn1, btn2, btn3, btn4, btn5)
+    bot.send_message(message.chat.id, "🚀 Работа начата!\n\nВыберите действие ниже.", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: message.text == '🔧 Войти в админ панель')
+def admin_panel(message):
+    user_id = message.from_user.id
+    roles = db.fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
+    if roles and 'admin' in roles[0]:
+        show_admin_panel(message)
+    else:
+        bot.send_message(message.chat.id, "У вас нет доступа к админ панели.")
+
+# Панель администратора
+def show_admin_panel(message):
+    markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
+    btn1 = types.KeyboardButton('📊 Статистика')
+    btn2 = types.KeyboardButton('👥 Список администраторов')
+    btn3 = types.KeyboardButton('👥 Список работников')
+    btn4 = types.KeyboardButton('🔙 Назад')
+    markup.add(btn1, btn2, btn3, btn4)
+    bot.send_message(message.chat.id, "🔧 Админ панель", reply_markup=markup)
+
+@bot.message_handler(func=lambda message: message.text == '📊 Статистика')
+def show_stats(message):
+    bot.send_message(message.chat.id, "Статистика за последние 7 дней будет добавлена позже.")
+
+@bot.message_handler(func=lambda message: message.text == '👥 Список администраторов')
+def list_admins(message):
+    admins = db.fetch_all("SELECT user_id, username FROM users WHERE roles LIKE '%admin%'")
+    response = "Список администраторов:\n\n"
+    markup = types.InlineKeyboardMarkup()
+    for admin in admins:
+        response += f"@{admin[1]} (ID: {admin[0]})\n"
+        markup.add(types.InlineKeyboardButton(f"Удалить @{admin[1]}", callback_data=f"remove_admin_{admin[0]}"))
+    markup.add(types.InlineKeyboardButton('➕ Добавить', callback_data='add_admin'))
+    bot.send_message(message.chat.id, response, reply_markup=markup)
+
+@bot.message_handler(func=lambda message: message.text == '👥 Список работников')
+def list_workers(message):
+    workers = db.fetch_all("SELECT user_id, username FROM users WHERE roles LIKE '%worker%'")
+    response = "Список работников:\n\n"
+    markup = types.InlineKeyboardMarkup()
+    for worker in workers:
+        response += f"@{worker[1]} (ID: {worker[0]})\n"
+        markup.add(types.InlineKeyboardButton(f"Удалить @{worker[1]}", callback_data=f"remove_worker_{worker[0]}"))
+    bot.send_message(message.chat.id, response, reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'add_admin')
+def add_admin(call):
+    msg = bot.send_message(call.message.chat.id, "Введите ID пользователя для добавления в администраторы:")
+    bot.register_next_step_handler(msg, process_add_admin)
+
+def process_add_admin(message):
+    try:
+        user_id = int(message.text)
+        add_role(user_id, 'admin')
+        bot.send_message(message.chat.id, f"Пользователь с ID {user_id} добавлен в администраторы.")
+    except ValueError:
+        bot.send_message(message.chat.id, "Пожалуйста, введите корректный ID пользователя.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_admin_'))
+def remove_admin(call):
+    user_id = int(call.data.split('_')[2])
+    remove_role(user_id, 'admin')
+    bot.send_message(call.message.chat.id, f"Пользователь с ID {user_id} удален из администраторов.")
+    list_admins(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_worker_'))
+def remove_worker(call):
+    user_id = int(call.data.split('_')[2])
+    remove_role(user_id, 'worker')
+    bot.send_message(call.message.chat.id, f"Пользователь с ID {user_id} удален из работников.")
+    list_workers(call.message)
 
 # Начать работу
 @bot.message_handler(func=lambda message: message.text == '🔄 Начать работу')
