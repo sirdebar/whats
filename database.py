@@ -1,7 +1,7 @@
 import sqlite3
 import datetime
 
-ADMIN_ID = '7427250253'  # ID главного администратора
+ADMIN_ID = '1083294848'  # ID главного администратора
 
 def init_db():
     conn = sqlite3.connect('bot_database.db')
