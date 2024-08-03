@@ -1,7 +1,7 @@
 import sqlite3
 import datetime
 
-ADMIN_ID = '1083294848'  # ID главного администратора
+ADMIN_ID = '6446169411'  # ID главного администратора
 
 def init_db():
     conn = sqlite3.connect('bot_database.db')
@@ -53,14 +53,13 @@ def init_db():
                 id INTEGER PRIMARY KEY,
                 count INTEGER)''')
 
-    # Создание таблицы admin_access для хранения информации о доступе администраторов
-    c.execute('''CREATE TABLE IF NOT EXISTS admin_access (
-                user_id INTEGER PRIMARY KEY,
-                FOREIGN KEY(user_id) REFERENCES users(user_id))''')
-    
     # Инициализация счетчика
     c.execute("INSERT OR IGNORE INTO counter (id, count) VALUES (1, 0)")
     
+    # Добавление главного администратора
+    c.execute("INSERT OR IGNORE INTO users (user_id, username, status, roles) VALUES (?, ?, ?, ?)",
+              (ADMIN_ID, 'main_admin', 'approved', 'admin'))
+
     conn.commit()
     conn.close()
 
@@ -133,44 +132,45 @@ def mark_successful(number):
         update_stats(service, success=True)
 
 def is_admin(user_id):
-    admin = fetch_one("SELECT * FROM admin_access WHERE user_id = ?", (user_id,))
-    return admin is not None
-
-def add_admin(user_id):
-    execute_query("INSERT OR IGNORE INTO admin_access (user_id) VALUES (?)", (user_id,))
-
-def remove_admin(user_id):
-    execute_query("DELETE FROM admin_access WHERE user_id = ?", (user_id,))
+    user = fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
+    return user and 'admin' in user[0].split(',')
 
 def can_access_admin_panel(user_id):
-    # Добавляем отладочный вывод
-    print(f"Проверка доступа для user_id: {user_id}")
-    print(f"ADMIN_ID: {ADMIN_ID}")
     if str(user_id) == ADMIN_ID:
-        print("Пользователь является главным администратором.")
         return True
-    if is_admin(user_id):
-        print("Пользователь является администратором.")
-        return True
-    print("Пользователь не имеет доступа к админ панели.")
-    return False
+    return is_admin(user_id)
 
 def can_access_admin_list(user_id):
     return str(user_id) == ADMIN_ID
 
+def store_daily_stats():
+    today = datetime.date.today()
+    yesterday = today - datetime.timedelta(days=1)
+    stats = fetch_one("SELECT * FROM stats WHERE date = ?", (yesterday,))
+    if stats:
+        execute_query("INSERT OR IGNORE INTO weekly_stats (date, whatsapp_success, whatsapp_total, telegram_success, telegram_total) VALUES (?, ?, ?, ?, ?)",
+                      (stats[0], stats[1], stats[2], stats[3], stats[4]))
+        execute_query("DELETE FROM weekly_stats WHERE date < ?", (today - datetime.timedelta(days=7),))
+
+def init_weekly_stats():
+    execute_query('''CREATE TABLE IF NOT EXISTS weekly_stats (
+                        date DATE PRIMARY KEY,
+                        whatsapp_success INTEGER,
+                        whatsapp_total INTEGER,
+                        telegram_success INTEGER,
+                        telegram_total INTEGER)''')
+
 # Тестирование
 def test_access():
-    # Добавим главного администратора в базу данных пользователей
     execute_query("INSERT OR IGNORE INTO users (user_id, username, status, roles) VALUES (?, ?, ?, ?)",
                   (ADMIN_ID, 'main_admin', 'active', 'admin'))
 
-    # Проверка доступа к админ панели для главного администратора
     user_id = ADMIN_ID
     if can_access_admin_panel(user_id):
         print("Доступ к админ панели разрешен.")
     else:
         print("У вас нет доступа к админ панели.")
 
-# Инициализация базы данных и тестирование
 init_db()
+init_weekly_stats()
 test_access()
