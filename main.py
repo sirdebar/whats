@@ -5,79 +5,215 @@ import time
 from threading import Thread, Timer
 import random
 import config
-import database as db
 import signal
 import requests
 from requests.exceptions import ReadTimeout, ConnectionError
 
+import sqlite3
+
+# База данных и конфигурация
+def init_db():
+    conn = sqlite3.connect(config.DATABASE)
+    c = conn.cursor()
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                status TEXT,
+                last_request_time DATETIME,
+                roles TEXT)''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS requests (
+                request_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                username TEXT,
+                status TEXT,
+                request_time DATETIME,
+                FOREIGN KEY(user_id) REFERENCES users(user_id))''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS numbers (
+                number_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                number TEXT,
+                service TEXT,
+                user_id INTEGER,
+                issued_to INTEGER,
+                issued_time DATETIME,
+                success INTEGER DEFAULT 0,
+                add_date DATE,
+                add_time TIME,
+                FOREIGN KEY(user_id) REFERENCES users(user_id))''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS stats (
+                date DATE PRIMARY KEY,
+                whatsapp_success INTEGER,
+                whatsapp_total INTEGER,
+                telegram_success INTEGER,
+                telegram_total INTEGER)''')
+
+    c.execute('''CREATE TABLE IF NOT EXISTS counter (
+                id INTEGER PRIMARY KEY,
+                count INTEGER)''')
+
+    c.execute("INSERT OR IGNORE INTO counter (id, count) VALUES (1, 0)")
+    c.execute("INSERT OR IGNORE INTO users (user_id, username, status, roles) VALUES (?, ?, ?, ?)",
+              (config.ADMIN_ID, 'main_admin', 'approved', 'admin'))
+
+    conn.commit()
+    conn.close()
+
+def execute_query(query, params=()):
+    conn = sqlite3.connect(config.DATABASE)
+    c = conn.cursor()
+    c.execute(query, params)
+    conn.commit()
+    conn.close()
+
+def fetch_all(query, params=()):
+    conn = sqlite3.connect(config.DATABASE)
+    c = conn.cursor()
+    c.execute(query, params)
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def fetch_one(query, params=()):
+    conn = sqlite3.connect(config.DATABASE)
+    c = conn.cursor()
+    c.execute(query, params)
+    row = c.fetchone()
+    conn.close()
+    return row
+
+def reset_counter():
+    execute_query("UPDATE counter SET count = 0 WHERE id = 1")
+
+def increment_counter():
+    execute_query("UPDATE counter SET count = count + 1 WHERE id = 1")
+
+def decrement_counter():
+    execute_query("UPDATE counter SET count = count - 1 WHERE id = 1")
+
+def get_counter():
+    row = fetch_one("SELECT count FROM counter WHERE id = 1")
+    return row[0] if row else 0
+
+def update_stats(service, success):
+    date = datetime.date.today()
+    stats = fetch_one("SELECT * FROM stats WHERE date = ?", (date,))
+    if stats:
+        if service == 'whatsapp':
+            if success:
+                execute_query("UPDATE stats SET whatsapp_success = whatsapp_success + 1 WHERE date = ?", (date,))
+            execute_query("UPDATE stats SET whatsapp_total = whatsapp_total + 1 WHERE date = ?", (date,))
+        elif service == 'telegram':
+            if success:
+                execute_query("UPDATE stats SET telegram_success = telegram_success + 1 WHERE date = ?", (date,))
+            execute_query("UPDATE stats SET telegram_total = telegram_total + 1 WHERE date = ?", (date,))
+    else:
+        if service == 'whatsapp':
+            execute_query("INSERT INTO stats (date, whatsapp_success, whatsapp_total, telegram_success, telegram_total) VALUES (?, ?, ?, ?, ?)",
+                          (date, 1 if success else 0, 1, 0, 0))
+        elif service == 'telegram':
+            execute_query("INSERT INTO stats (date, whatsapp_success, whatsapp_total, telegram_success, telegram_total) VALUES (?, ?, ?, ?, ?)",
+                          (date, 0, 0, 1 if success else 0, 1))
+
+def get_stats():
+    date = datetime.date.today()
+    stats = fetch_one("SELECT * FROM stats WHERE date = ?", (date,))
+    return stats if stats else (date, 0, 0, 0, 0)
+
+def mark_successful(number):
+    execute_query("UPDATE numbers SET success = 1 WHERE number = ?", (number,))
+    number_info = fetch_one("SELECT service FROM numbers WHERE number = ?", (number,))
+    if number_info:
+        service = number_info[0]
+        update_stats(service, success=True)
+
+def is_admin(user_id):
+    user = fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
+    return user and 'admin' in user[0].split(',')
+
+def can_access_admin_panel(user_id):
+    if str(user_id) == config.ADMIN_ID:
+        return True
+    return is_admin(user_id)
+
+def can_access_admin_list(user_id):
+    return str(user_id) == config.ADMIN_ID
+
+def store_daily_stats():
+    today = datetime.date.today()
+    yesterday = today - datetime.timedelta(days=1)
+    stats = fetch_one("SELECT * FROM stats WHERE date = ?", (yesterday,))
+    if stats:
+        execute_query("INSERT OR IGNORE INTO weekly_stats (date, whatsapp_success, whatsapp_total, telegram_success, telegram_total) VALUES (?, ?, ?, ?, ?)",
+                      (stats[0], stats[1], stats[2], stats[3], stats[4]))
+        execute_query("DELETE FROM weekly_stats WHERE date < ?", (today - datetime.timedelta(days=7),))
+
+def init_weekly_stats():
+    execute_query('''CREATE TABLE IF NOT EXISTS weekly_stats (
+                        date DATE PRIMARY KEY,
+                        whatsapp_success INTEGER,
+                        whatsapp_total INTEGER,
+                        telegram_success INTEGER,
+                        telegram_total INTEGER)''')
+
 bot = telebot.TeleBot(config.API_TOKEN, parse_mode='HTML')
-db.init_db()
+init_db()
 
 user_data = {}
 admin_data = {}
 recently_issued_numbers = {}
 
 def retry_request(func, *args, retries=3, delay=2, **kwargs):
-    """
-    Retry a function call multiple times in case of exceptions.
-    
-    Parameters:
-        func (function): The function to be called.
-        *args: Variable length argument list for the function.
-        retries (int): Number of retries.
-        delay (int): Delay between retries in seconds.
-        **kwargs: Arbitrary keyword arguments for the function.
-    
-    Returns:
-        Response from the function, or None if it fails after retries.
-    """
     for attempt in range(retries):
         try:
             return func(*args, **kwargs)
-        except (ReadTimeout, ConnectionError) as e:
+        except (ReadTimeout, ConnectionError):
             if attempt < retries - 1:
                 time.sleep(delay)
             else:
-                raise e
+                raise
 
-# Инициализация данных пользователя в базе данных
 def init_user_data(user_id, username):
-    user = db.fetch_one("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    user = fetch_one("SELECT * FROM users WHERE user_id = ?", (user_id,))
     if not user:
-        db.execute_query("INSERT INTO users (user_id, username, status, last_request_time) VALUES (?, ?, ?, ?)",
-                         (user_id, username, 'pending', None))
+        execute_query("INSERT INTO users (user_id, username, status, last_request_time, roles) VALUES (?, ?, ?, ?, ?)",
+                      (user_id, username, 'pending', None, ''))
+    else:
+        roles = user[4].split(',')
+        if str(user_id) == config.ADMIN_ID and 'admin' not in roles:
+            add_role(user_id, 'admin')
 
 def add_role(user_id, role):
-    user = db.fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
+    user = fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
     if user:
         roles = user[0]
-        if role not in roles:
-            roles += f",{role}"
-            db.execute_query("UPDATE users SET roles = ? WHERE user_id = ?", (roles, user_id))
-    else:
-        db.execute_query("INSERT INTO users (user_id, roles) VALUES (?, ?)", (user_id, role))
+        if role not in roles.split(','):
+            roles = roles + f",{role}" if roles else role
+            execute_query("UPDATE users SET roles = ? WHERE user_id = ?", (roles, user_id))
 
 def remove_role(user_id, role):
-    user = db.fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
+    user = fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
     if user:
         roles = user[0].split(',')
         if role in roles:
             roles.remove(role)
-            db.execute_query("UPDATE users SET roles = ? WHERE user_id = ?", (','.join(roles), user_id))
+            execute_query("UPDATE users SET roles = ? WHERE user_id = ?", (','.join(roles), user_id))
 
-# Приветствие и старт
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
     user_id = message.from_user.id
     username = message.from_user.username
-    
+
     if str(user_id) == config.ADMIN_ID:
+        add_role(user_id, 'admin')
         show_admin_main_menu(message)
         return
 
     init_user_data(user_id, username)
-    user = db.fetch_one("SELECT status FROM users WHERE user_id = ?", (user_id,))
-    if user[0] == 'approved':
+    user = fetch_one("SELECT status, roles FROM users WHERE user_id = ?", (user_id,))
+    if user[0] == 'approved' or 'admin' in user[1].split(',') or 'worker' in user[1].split(','):
         user_data[user_id] = {'whatsapp': [], 'telegram': [], 'start_time': None, 'sms_requests': {}}
         markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
         btn1 = types.KeyboardButton('🔄 Начать работу')
@@ -86,7 +222,6 @@ def send_welcome(message):
     else:
         show_pending_menu(message)
 
-# Меню для ожидания одобрения
 def show_pending_menu(message):
     markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
     btn1 = types.KeyboardButton('Отправить заявку на вступление')
@@ -94,35 +229,31 @@ def show_pending_menu(message):
     markup.add(btn1, btn2)
     bot.send_message(message.chat.id, "Вы не имеете доступа к функционалу. Пожалуйста, отправьте заявку на вступление.", reply_markup=markup)
 
-# Обработка заявки на вступление
 @bot.message_handler(func=lambda message: message.text == 'Отправить заявку на вступление')
 def request_access(message):
     user_id = message.from_user.id
     username = message.from_user.username
     now = datetime.datetime.now()
 
-    user = db.fetch_one("SELECT last_request_time FROM users WHERE user_id = ?", (user_id,))
+    user = fetch_one("SELECT last_request_time FROM users WHERE user_id = ?", (user_id,))
     
     if user and user[0]:
         try:
             last_request_time = datetime.datetime.strptime(user[0], '%Y-%m-%d %H:%M:%S.%f')
-            if (now - last_request_time).total_seconds() < 10:
-                bot.send_message(message.chat.id, "Вы можете подать заявку только через 10 секунд после последней попытки.")
-                return
         except ValueError:
             last_request_time = datetime.datetime.strptime(user[0], '%Y-%m-%d %H:%M:%S')
-            if (now - last_request_time).total_seconds() < 10:
-                bot.send_message(message.chat.id, "Вы можете подать заявку только через 10 секунд после последней попытки.")
-                return
 
-    db.execute_query("INSERT INTO requests (user_id, username, status, request_time) VALUES (?, ?, ?, ?)",
-                     (user_id, username, 'pending', now))
-    db.execute_query("UPDATE users SET last_request_time = ? WHERE user_id = ?", (now, user_id))
+        if (now - last_request_time).total_seconds() < 10:
+            bot.send_message(message.chat.id, "Вы можете подать заявку только через 10 секунд после последней попытки.")
+            return
+
+    execute_query("INSERT INTO requests (user_id, username, status, request_time) VALUES (?, ?, ?, ?)",
+                  (user_id, username, 'pending', now))
+    execute_query("UPDATE users SET last_request_time = ? WHERE user_id = ?", (now, user_id))
     
     bot.send_message(message.chat.id, "Ваша заявка на вступление отправлена.")
     bot.send_message(config.ADMIN_ID, f"Получена заявка на вступление от @{username}", reply_markup=admin_approval_markup(user_id))
 
-# Кнопки одобрения/отказа для администратора
 def admin_approval_markup(user_id):
     markup = types.InlineKeyboardMarkup(row_width=2)
     btn1 = types.InlineKeyboardButton("Одобрить", callback_data=f"approve_{user_id}")
@@ -133,8 +264,8 @@ def admin_approval_markup(user_id):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('approve_'))
 def approve_request(call):
     user_id = int(call.data.split('_')[1])
-    db.execute_query("UPDATE users SET status = 'approved' WHERE user_id = ?", (user_id,))
-    db.execute_query("UPDATE requests SET status = 'approved' WHERE user_id = ? AND status = 'pending'", (user_id,))
+    execute_query("UPDATE users SET status = 'approved' WHERE user_id = ?", (user_id,))
+    execute_query("UPDATE requests SET status = 'approved' WHERE user_id = ? AND status = 'pending'", (user_id,))
     bot.send_message(call.message.chat.id, f"Заявка на вступление пользователя с ID {user_id} одобрена.")
     bot.send_message(user_id, "Заявка на вступление одобрена. Добро пожаловать!")
     show_main_menu_by_user_id(user_id)
@@ -143,7 +274,7 @@ def approve_request(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('reject_'))
 def reject_request(call):
     user_id = int(call.data.split('_')[1])
-    db.execute_query("UPDATE requests SET status = 'rejected' WHERE user_id = ? AND status = 'pending'", (user_id,))
+    execute_query("UPDATE requests SET status = 'rejected' WHERE user_id = ? AND status = 'pending'", (user_id,))
     bot.send_message(call.message.chat.id, f"Заявка на вступление пользователя с ID {user_id} отклонена.")
     bot.send_message(user_id, "Вам отказано в доступе. Попробуйте еще раз через 24 часа, если считаете, что это ошибка.")
     bot.answer_callback_query(call.id)
@@ -157,7 +288,6 @@ def show_main_menu_by_user_id(user_id):
     markup.add(btn1, btn2, btn3, btn4)
     bot.send_message(user_id, "🚀 Работа начата!\n\nВыберите действие ниже.", reply_markup=markup)
 
-# Показать главное меню
 def show_main_menu(message):
     markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
     btn1 = types.KeyboardButton('➕ Добавить номера')
@@ -167,27 +297,24 @@ def show_main_menu(message):
     markup.add(btn1, btn2, btn3, btn4)
     bot.send_message(message.chat.id, "🚀 Работа начата!\n\nВыберите действие ниже.", reply_markup=markup)
 
-# Главное меню для администратора
 def show_admin_main_menu(message):
     markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
     btn1 = types.KeyboardButton('➕ Добавить номера')
     btn2 = types.KeyboardButton('📊 Профиль')
     btn3 = types.KeyboardButton('📋 Добавленные номера')
     btn4 = types.KeyboardButton('⏹️ Закончить работу')
-    btn5 = types.KeyboardButton('🔧 Войти в админ панель')  # Новая кнопка для админ панели
+    btn5 = types.KeyboardButton('🔧 Войти в админ панель')
     markup.add(btn1, btn2, btn3, btn4, btn5)
     bot.send_message(message.chat.id, "🚀 Работа начата!\n\nВыберите действие ниже.", reply_markup=markup)
 
 @bot.message_handler(func=lambda message: message.text == '🔧 Войти в админ панель')
 def admin_panel(message):
     user_id = message.from_user.id
-    roles = db.fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
-    if roles and ('admin' in roles[0] or str(user_id) == config.ADMIN_ID):
+    if can_access_admin_panel(user_id):
         show_admin_panel(message)
     else:
         bot.send_message(message.chat.id, "У вас нет доступа к админ панели.")
 
-# Панель администратора
 def show_admin_panel(message):
     markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
     btn1 = types.KeyboardButton('📊 Статистика')
@@ -203,7 +330,11 @@ def show_stats(message):
 
 @bot.message_handler(func=lambda message: message.text == '👥 Список администраторов')
 def list_admins(message):
-    admins = db.fetch_all("SELECT user_id, username FROM users WHERE roles LIKE '%admin%'")
+    if not can_access_admin_list(message.from_user.id):
+        bot.send_message(message.chat.id, "У вас нет прав на просмотр этого списка.")
+        return
+
+    admins = fetch_all("SELECT user_id, username FROM users WHERE roles LIKE '%admin%'")
     response = "Список администраторов:\n\n"
     markup = types.InlineKeyboardMarkup()
     for admin in admins:
@@ -214,7 +345,7 @@ def list_admins(message):
 
 @bot.message_handler(func=lambda message: message.text == '👥 Список работников')
 def list_workers(message):
-    workers = db.fetch_all("SELECT user_id, username FROM users WHERE roles LIKE '%worker%'")
+    workers = fetch_all("SELECT user_id, username FROM users WHERE roles LIKE '%worker%'")
     response = "Список работников:\n\n"
     markup = types.InlineKeyboardMarkup()
     for worker in workers:
@@ -249,7 +380,6 @@ def remove_worker(call):
     bot.send_message(call.message.chat.id, f"Пользователь с ID {user_id} удален из работников.")
     list_workers(call.message)
 
-# Начать работу
 @bot.message_handler(func=lambda message: message.text == '🔄 Начать работу')
 def start_work(message):
     user_id = message.from_user.id
@@ -258,7 +388,6 @@ def start_work(message):
     user_data[user_id]['start_time'] = datetime.datetime.now()
     show_main_menu(message)
 
-# Добавить номера
 @bot.message_handler(func=lambda message: message.text == '➕ Добавить номера')
 def add_numbers(message):
     markup = types.InlineKeyboardMarkup(row_width=2)
@@ -276,7 +405,6 @@ def add_numbers(message):
 @bot.callback_query_handler(func=lambda call: call.data in ['add_whatsapp', 'add_telegram'])
 def choose_service(call):
     service = call.data.split('_')[1]
-    user_id = call.from_user.id
     msg = bot.send_message(call.message.chat.id, f"Введите список номеров для {service.capitalize()} в формате 9123456789, каждый номер с новой строки:")
     bot.register_next_step_handler(msg, process_numbers, service)
     show_back_button(call.message)
@@ -299,12 +427,12 @@ def process_numbers(message, service):
     if service == 'whatsapp' and len(user_data[user_id][service]) > 25:
         user_data[user_id][service] = user_data[user_id][service][:25]
 
-    queue_data = db.fetch_all("SELECT number FROM numbers WHERE service = ? AND issued_to IS NULL", (service,))
+    queue_data = fetch_all("SELECT number FROM numbers WHERE service = ? AND issued_to IS NULL", (service,))
     queue_numbers = [entry[0] for entry in queue_data]
     for number in valid_numbers:
         if number['number'] not in queue_numbers:
-            db.execute_query("INSERT INTO numbers (number, service, user_id, add_date, add_time) VALUES (?, ?, ?, ?, ?)",
-                             (number['number'], service, user_id, number['timestamp'].date(), number['timestamp'].time().strftime('%H:%M:%S')))
+            execute_query("INSERT INTO numbers (number, service, user_id, add_date, add_time) VALUES (?, ?, ?, ?, ?)",
+                          (number['number'], service, user_id, number['timestamp'].date(), number['timestamp'].time().strftime('%H:%M:%S')))
 
     response = f"✅ Обработка номеров {service.capitalize()} завершена!\n\n"
     response += f"➕ Добавлено записей: {len(valid_numbers)}\n"
@@ -314,7 +442,6 @@ def process_numbers(message, service):
     bot.send_message(message.chat.id, response)
     show_back_button(message)
 
-# Показать статистику
 @bot.message_handler(func=lambda message: message.text == '📊 Профиль')
 def show_profile(message):
     user_id = message.from_user.id
@@ -322,7 +449,7 @@ def show_profile(message):
         bot.send_message(message.chat.id, "Сначала начните работу, чтобы видеть статистику.")
         return
 
-    stats = db.get_stats()
+    stats = get_stats()
     whatsapp_success, whatsapp_total = stats[1], stats[2]
     telegram_success, telegram_total = stats[3], stats[4]
 
@@ -347,23 +474,6 @@ def show_profile(message):
     except (ReadTimeout, ConnectionError):
         bot.send_message(message.chat.id, "Ошибка сети. Пожалуйста, попробуйте снова позже.")
 
-@bot.message_handler(func=lambda message: message.text.lower() == 'стата')
-def show_overall_stats(message):
-    stats = db.get_stats()
-    whatsapp_success, whatsapp_total = stats[1], stats[2]
-    telegram_success, telegram_total = stats[3], stats[4]
-
-    response = f"📊 Статистика номеров за сегодня:\n\n"
-    response += f"🟢 WhatsApp:\n"
-    response += f"⊦ Удачных: {whatsapp_success}\n"
-    response += f"⨽ Всего: {whatsapp_total}\n\n"
-    response += f"🔵 Telegram:\n"
-    response += f"⊦ Удачных: {telegram_success}\n"
-    response += f"⨽ Всего: {telegram_total}\n"
-
-    bot.send_message(message.chat.id, response)
-
-# Показать добавленные номера и возможность удаления
 @bot.message_handler(func=lambda message: message.text == '📋 Добавленные номера')
 def show_added_numbers(message):
     user_id = message.from_user.id
@@ -405,7 +515,7 @@ def delete_number(call):
         for entry in user_data[user_id][service]:
             if entry['number'] == number and entry['timestamp'] == timestamp:
                 user_data[user_id][service].remove(entry)
-                db.execute_query("DELETE FROM numbers WHERE number = ?", (number,))
+                execute_query("DELETE FROM numbers WHERE number = ?", (number,))
                 bot.send_message(user_id, f"Номер {number} удален из очереди!")
                 bot.edit_message_text("Ваши номера:", call.message.chat.id, call.message.message_id, reply_markup=None)
                 show_numbers_page(call.message, user_id, 0)
@@ -418,7 +528,6 @@ def handle_pagination(call):
     bot.delete_message(call.message.chat.id, call.message.message_id)
     show_numbers_page(call.message, user_id, page)
 
-# Закончить работу
 @bot.message_handler(func=lambda message: message.text == '⏹️ Закончить работу')
 def end_work(message):
     user_id = message.from_user.id
@@ -430,25 +539,23 @@ def end_work(message):
     user_data[user_id]['telegram'] = []
     bot.send_message(message.chat.id, "⏹️ Работа завершена. Все ваши номера удалены из очереди.")
 
-# Принудительное удаление номеров
 @bot.message_handler(commands=['rm'])
 def remove_numbers(message):
     numbers = message.text.split()[1:]
     for number in numbers:
-        db.execute_query("DELETE FROM numbers WHERE number = ?", (number,))
+        execute_query("DELETE FROM numbers WHERE number = ?", (number,))
         bot.send_message(message.chat.id, f"Номер {number} удален из базы данных.")
 
-# Обработка покупок номеров и получения SMS
 @bot.message_handler(func=lambda message: message.text.lower() in ['вотс', 'телега'])
 def handle_purchase(message):
     service = 'whatsapp' if message.text.lower() == 'вотс' else 'telegram'
-    queue_data = db.fetch_all("SELECT * FROM numbers WHERE service = ? AND issued_to IS NULL", (service,))
+    queue_data = fetch_all("SELECT * FROM numbers WHERE service = ? AND issued_to IS NULL", (service,))
     if queue_data:
         number_entry = random.choice(queue_data)
         number = number_entry[1]
         user_id = number_entry[3]
-        db.execute_query("UPDATE numbers SET issued_to = ?, issued_time = ? WHERE number = ?",
-                         (message.from_user.id, datetime.datetime.now(), number))
+        execute_query("UPDATE numbers SET issued_to = ?, issued_time = ? WHERE number = ?",
+                      (message.from_user.id, datetime.datetime.now(), number))
         if service not in recently_issued_numbers:
             recently_issued_numbers[service] = []
         recently_issued_numbers[service].append(number)
@@ -462,9 +569,8 @@ def handle_purchase(message):
         )
         bot.send_message(message.chat.id, f"<b>Номер:</b> <a href='tel:{number}'>{number}</a>", reply_markup=markup)
         bot.send_message(user_id, f"Номер {number} был выдан пользователю {message.from_user.username}.")
-        db.increment_counter()
-        db.update_stats(service, success=False)
-        # Schedule the check for 10 minutes later
+        increment_counter()
+        update_stats(service, success=False)
         Timer(600, finalize_number_status, args=(number, message)).start()
     else:
         bot.send_message(message.chat.id, f"Нет доступных номеров для {service.capitalize()}.")
@@ -473,7 +579,7 @@ def handle_purchase(message):
 def request_sms(call):
     number = call.data.split('_')[2]
     bot.send_message(call.message.chat.id, f"Ожидание СМС. Номер: <a href='tel:{number}'>{number}</a>")
-    worker_id = db.fetch_one("SELECT user_id FROM numbers WHERE number = ?", (number,))
+    worker_id = fetch_one("SELECT user_id FROM numbers WHERE number = ?", (number,))
     if worker_id:
         worker_id = worker_id[0]
         request_msg = bot.send_message(worker_id, f"Запрошен СМС по номеру {number}. Пришлите смс ответом на это сообщение.", reply_markup=worker_sms_markup(number))
@@ -492,10 +598,10 @@ def worker_sms_markup(number):
 def receive_sms(message, number):
     user_id = message.from_user.id
     if user_id in user_data and 'sms_requests' in user_data[user_id] and number in user_data[user_id]['sms_requests']:
-        issued_to = db.fetch_one("SELECT issued_to FROM numbers WHERE number = ?", (number,))
+        issued_to = fetch_one("SELECT issued_to FROM numbers WHERE number = ?", (number,))
         if issued_to:
             issued_to = issued_to[0]
-            response = f"Номер: <a href='tel:{number}'>{number}</a>\n<b>SMS:</b> {message.text}\n+{db.get_counter()}"
+            response = f"Номер: <a href='tel:{number}'>{number}</a>\n<b>SMS:</b> {message.text}\n+{get_counter()}"
             bot.send_message(config.GROUP_ID, response)
             del user_data[user_id]['sms_requests'][number]
         else:
@@ -506,10 +612,10 @@ def receive_sms(message, number):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('replace_number_'))
 def replace_number(call):
     number = call.data.split('_')[2]
-    service_data = db.fetch_one("SELECT service FROM numbers WHERE number = ?", (number,))
+    service_data = fetch_one("SELECT service FROM numbers WHERE number = ?", (number,))
     if service_data:
         service = service_data[0]
-        queue_data = db.fetch_all("SELECT number FROM numbers WHERE service = ? AND issued_to IS NULL", (service,))
+        queue_data = fetch_all("SELECT number FROM numbers WHERE service = ? AND issued_to IS NULL", (service,))
         queue_numbers = [entry[0] for entry in queue_data if entry[0] not in recently_issued_numbers.get(service, [])]
         if not queue_numbers:
             queue_numbers = [entry[0] for entry in queue_data]
@@ -519,9 +625,9 @@ def replace_number(call):
             recently_issued_numbers[service].append(new_number)
             if len(recently_issued_numbers[service]) > len(queue_data):
                 recently_issued_numbers[service].pop(0)
-            db.execute_query("UPDATE numbers SET issued_to = ?, issued_time = ? WHERE number = ?",
-                             (call.from_user.id, datetime.datetime.now(), new_number))
-            db.execute_query("UPDATE numbers SET issued_to = NULL, issued_time = NULL WHERE number = ?", (number,))
+            execute_query("UPDATE numbers SET issued_to = ?, issued_time = ? WHERE number = ?",
+                          (call.from_user.id, datetime.datetime.now(), new_number))
+            execute_query("UPDATE numbers SET issued_to = NULL, issued_time = NULL WHERE number = ?", (number,))
             markup = types.InlineKeyboardMarkup(row_width=1)
             sms_button = types.InlineKeyboardButton('Запросить СМС', callback_data=f'request_sms_{new_number}')
             replace_button = types.InlineKeyboardButton('Замена', callback_data=f'replace_number_{new_number}')
@@ -535,63 +641,58 @@ def replace_number(call):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('cancel_sms_'))
 def cancel_sms(call):
     number = call.data.split('_')[2]
-    worker_id = db.fetch_one("SELECT user_id FROM numbers WHERE number = ?", (number,))[0]
+    worker_id = fetch_one("SELECT user_id FROM numbers WHERE number = ?", (number,))[0]
     if worker_id and worker_id in user_data and 'sms_requests' in user_data[worker_id] and number in user_data[worker_id]['sms_requests']:
         request_msg_id = user_data[worker_id]['sms_requests'][number]
         bot.delete_message(worker_id, request_msg_id)
         del user_data[worker_id]['sms_requests'][number]
         bot.send_message(worker_id, f"Вы отказались от номера {number}")
         bot.send_message(config.GROUP_ID, f"Отказ по номеру {number}, попробуйте заново.")
-        db.execute_query("UPDATE numbers SET issued_to = NULL, issued_time = NULL WHERE number = ?", (number,))
+        execute_query("UPDATE numbers SET issued_to = NULL, issued_time = NULL WHERE number = ?", (number,))
     bot.answer_callback_query(call.id)
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('decrement_counter_'))
 def decrement_counter(call):
     number = call.data.split('_')[2]
-    db.decrement_counter()
-    db.execute_query("DELETE FROM numbers WHERE number = ?", (number,))
+    decrement_counter()
+    execute_query("DELETE FROM numbers WHERE number = ?", (number,))
     bot.send_message(call.message.chat.id, f"Номер {number} слетел. Счетчик уменьшен.")
     bot.answer_callback_query(call.id)
 
 def finalize_number_status(number, message):
-    number_info = db.fetch_one("SELECT success FROM numbers WHERE number = ?", (number,))
+    number_info = fetch_one("SELECT success FROM numbers WHERE number = ?", (number,))
     if number_info and number_info[0] == 0:
         bot.send_message(message.chat.id, f"Номер {number} не был подтвержден в течение 10 минут и считается слетевшим.")
-        db.execute_query("DELETE FROM numbers WHERE number = ?", (number,))
+        execute_query("DELETE FROM numbers WHERE number = ?", (number,))
     else:
-        db.mark_successful(number)
+        mark_successful(number)
         bot.send_message(message.chat.id, f"Номер {number} успешно подтвержден и добавлен в удачные.")
 
-# Автоматическое удаление номеров и сброс счетчика в 02:00 по МСК
 def auto_clear():
     while True:
         now = datetime.datetime.now()
         if now.hour == 2 and now.minute == 0:
-            db.execute_query("DELETE FROM numbers")
-            db.reset_counter()
+            execute_query("DELETE FROM numbers")
+            reset_counter()
             for user_id in user_data:
                 user_data[user_id]['whatsapp'] = []
                 user_data[user_id]['telegram'] = []
             bot.send_message(config.ADMIN_ID, f"🔄 Автоматический сброс номеров завершен.")
             time.sleep(60)
 
-# Запуск потока для автоудаления
 Thread(target=auto_clear).start()
 
-# Кнопка "Назад" для возврата в главное меню
 def show_back_button(message):
     markup = types.InlineKeyboardMarkup()
     back_button = types.InlineKeyboardButton('🔙 Назад', callback_data='go_back')
     markup.add(back_button)
     bot.send_message(message.chat.id, "🔙 Нажмите 'Назад' для возврата в главное меню.", reply_markup=markup)
 
-# Обработка нажатия кнопки "Назад"
 @bot.callback_query_handler(func=lambda call: call.data == 'go_back')
 def handle_back(call):
     show_main_menu(call.message)
     bot.answer_callback_query(call.id)
 
-# Заявки на доступ
 @bot.message_handler(func=lambda message: message.text == 'Подать заявку на доступ')
 def request_access(message):
     user_id = message.from_user.id
@@ -602,7 +703,7 @@ def request_access(message):
 def view_requests(message):
     user_id = message.from_user.id
     if str(user_id) == config.ADMIN_ID:
-        pending_requests = db.fetch_all("SELECT * FROM requests WHERE status = 'pending'")
+        pending_requests = fetch_all("SELECT * FROM requests WHERE status = 'pending'")
         if pending_requests:
             response = "Заявки ожидающие подтверждения:\n\n"
             markup = types.InlineKeyboardMarkup(row_width=1)
@@ -618,7 +719,7 @@ def view_requests(message):
 @bot.callback_query_handler(func=lambda call: call.data.startswith('show_request_'))
 def show_request(call):
     user_id = int(call.data.split('_')[2])
-    request = db.fetch_one("SELECT * FROM requests WHERE user_id = ? AND status = 'pending'", (user_id,))
+    request = fetch_one("SELECT * FROM requests WHERE user_id = ? AND status = 'pending'", (user_id,))
     if request:
         response = f"Новая заявка от @{request['username']} (ID: {request['user_id']})\n"
         response += "Одобрить или Отказать?"
@@ -627,7 +728,6 @@ def show_request(call):
         bot.send_message(call.message.chat.id, "Заявка уже обработана.")
     bot.answer_callback_query(call.id)
 
-# Статистика для админов
 @bot.message_handler(commands=['admin_stats'])
 def admin_stats(message):
     user_id = message.from_user.id
@@ -639,7 +739,6 @@ def admin_stats(message):
     else:
         bot.send_message(message.chat.id, "У вас нет прав на просмотр этой информации.")
 
-# Удаление работника администратором
 @bot.message_handler(commands=['removeworker'])
 def remove_worker(message):
     if str(message.from_user.id) != config.ADMIN_ID:
@@ -648,16 +747,15 @@ def remove_worker(message):
 
     try:
         user_id = int(message.text.split()[1])
-        db.execute_query("DELETE FROM users WHERE user_id = ?", (user_id,))
-        db.execute_query("DELETE FROM requests WHERE user_id = ?", (user_id,))
-        db.execute_query("DELETE FROM numbers WHERE user_id = ?", (user_id,))
-        db.execute_query("DELETE FROM numbers WHERE issued_to = ?", (user_id,))
+        execute_query("DELETE FROM users WHERE user_id = ?", (user_id,))
+        execute_query("DELETE FROM requests WHERE user_id = ?", (user_id,))
+        execute_query("DELETE FROM numbers WHERE user_id = ?", (user_id,))
+        execute_query("DELETE FROM numbers WHERE issued_to = ?", (user_id,))
         bot.send_message(message.chat.id, f"Пользователь с ID {user_id} удален из списка работников.")
         bot.send_message(user_id, "Ваш доступ к функционалу бота был отозван. Пожалуйста, подайте заявку на вступление.")
     except (IndexError, ValueError):
         bot.send_message(message.chat.id, "Пожалуйста, укажите корректный ID пользователя после команды /removeworker.")
 
-# Запуск бота
 def signal_handler(signal, frame):
     print('Остановка бота...')
     bot.stop_polling()
@@ -666,7 +764,7 @@ def signal_handler(signal, frame):
 signal.signal(signal.SIGINT, signal_handler)
 
 if __name__ == '__main__':
-    add_role(config.ADMIN_ID, 'admin')  # Добавляем роль администратора при запуске
+    add_role(config.ADMIN_ID, 'admin')
     try:
         bot.polling(none_stop=True, timeout=30)
     except KeyboardInterrupt:
