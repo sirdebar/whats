@@ -127,6 +127,9 @@ def get_stats():
     stats = fetch_one("SELECT * FROM stats WHERE date = ?", (date,))
     return stats if stats else (date, 0, 0, 0, 0)
 
+def remove_numbers_by_user(user_id):
+    execute_query("DELETE FROM numbers WHERE issued_to = ?", (user_id,))
+
 def mark_successful(number):
     service_info = fetch_one("SELECT service, issued_to FROM numbers WHERE number = ?", (number,))
     if service_info:
