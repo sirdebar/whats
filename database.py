@@ -1,27 +1,24 @@
-# database.py
+# file: database.py
 
 import sqlite3
 import datetime
 
-ADMIN_ID = '6446169411'  # ID главного администратора
+ADMIN_ID = '6446169411'
 
 def init_db():
     conn = sqlite3.connect('bot_database.db')
     c = conn.cursor()
     
-    # Удаление старой таблицы numbers
     c.execute('''DROP TABLE IF EXISTS numbers''')
     
-    # Создание таблицы users
     c.execute('''CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 username TEXT,
                 status TEXT,
                 last_request_time DATETIME,
                 roles TEXT,
-                earnings REAL DEFAULT 0)''')  # Добавлен столбец earnings
+                earnings REAL DEFAULT 0)''') 
     
-    # Создание таблицы requests
     c.execute('''CREATE TABLE IF NOT EXISTS requests (
                 request_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER,
@@ -30,7 +27,6 @@ def init_db():
                 request_time DATETIME,
                 FOREIGN KEY(user_id) REFERENCES users(user_id))''')
     
-    # Создание таблицы numbers
     c.execute('''CREATE TABLE IF NOT EXISTS numbers (
                 number_id INTEGER PRIMARY KEY AUTOINCREMENT,
                 number TEXT,
@@ -43,7 +39,6 @@ def init_db():
                 add_time TIME,
                 FOREIGN KEY(user_id) REFERENCES users(user_id))''')
     
-    # Создание таблицы stats для статистики
     c.execute('''CREATE TABLE IF NOT EXISTS stats (
                 date DATE PRIMARY KEY,
                 whatsapp_success INTEGER,
@@ -51,20 +46,32 @@ def init_db():
                 telegram_success INTEGER,
                 telegram_total INTEGER)''')
 
-    # Создание таблицы counter для счетчика успешно выданных номеров
     c.execute('''CREATE TABLE IF NOT EXISTS counter (
                 id INTEGER PRIMARY KEY,
                 count INTEGER)''')
 
-    # Инициализация счетчика
+    c.execute('''CREATE TABLE IF NOT EXISTS blackjack_game (
+                user_id INTEGER PRIMARY KEY,
+                player_hand TEXT,
+                dealer_hand TEXT,
+                bet REAL,
+                FOREIGN KEY(user_id) REFERENCES users(user_id))''')
+    
+    c.execute('''CREATE TABLE IF NOT EXISTS roulette_game (
+                user_id INTEGER PRIMARY KEY,
+                bet REAL,
+                color TEXT,
+                FOREIGN KEY(user_id) REFERENCES users(user_id))''')
+
     c.execute("INSERT OR IGNORE INTO counter (id, count) VALUES (1, 0)")
     
-    # Добавление главного администратора
     c.execute("INSERT OR IGNORE INTO users (user_id, username, status, roles) VALUES (?, ?, ?, ?)",
               (ADMIN_ID, 'main_admin', 'approved', 'admin'))
 
     conn.commit()
     conn.close()
+
+# Остальные функции (execute_query, fetch_all, fetch_one, reset_counter и т.д.) остаются без изменений
 
 def execute_query(query, params=()):
     conn = sqlite3.connect('bot_database.db')
@@ -166,6 +173,13 @@ def store_daily_stats():
                       (stats[0], stats[1], stats[2], stats[3], stats[4]))
         execute_query("DELETE FROM weekly_stats WHERE date < ?", (today - datetime.timedelta(days=7),))
 
+def update_earnings(user_id, amount):
+    execute_query("UPDATE users SET earnings = earnings + ? WHERE user_id = ?", (amount, user_id))
+
+def fetch_user_earnings(user_id):
+    row = fetch_one("SELECT earnings FROM users WHERE user_id = ?", (user_id,))
+    return row[0] if row else 0
+
 def init_weekly_stats():
     execute_query('''CREATE TABLE IF NOT EXISTS weekly_stats (
                         date DATE PRIMARY KEY,
@@ -174,7 +188,6 @@ def init_weekly_stats():
                         telegram_success INTEGER,
                         telegram_total INTEGER)''')
 
-# Тестирование
 def test_access():
     execute_query("INSERT OR IGNORE INTO users (user_id, username, status, roles) VALUES (?, ?, ?, ?)",
                   (ADMIN_ID, 'main_admin', 'active', 'admin'))
