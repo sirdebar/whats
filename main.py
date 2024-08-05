@@ -1,3 +1,5 @@
+# main.py
+
 import telebot
 from telebot import types
 import datetime
@@ -9,7 +11,7 @@ import signal
 import requests
 from requests.exceptions import ReadTimeout, ConnectionError
 import database as db  # Импортируем ваш файл database.py
-    
+
 bot = telebot.TeleBot(config.API_TOKEN, parse_mode='HTML')
 
 user_data = {}
@@ -51,6 +53,16 @@ def remove_role(user_id, role):
         if role in roles:
             roles.remove(role)
             db.execute_query("UPDATE users SET roles = ? WHERE user_id = ?", (','.join(roles), user_id))
+            if role == 'worker':
+                show_pending_menu_by_user_id(user_id)
+
+def show_pending_menu_by_user_id(user_id):
+    markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
+    btn1 = types.KeyboardButton('Отправить заявку на вступление')
+    btn2 = types.KeyboardButton('Мои заявки')
+    markup.add(btn1, btn2)
+    bot.send_message(user_id, "Вы не имеете доступа к функционалу. Пожалуйста, отправьте заявку на вступление.", reply_markup=markup)
+
 
 @bot.message_handler(commands=['start', 'help'])
 def send_welcome(message):
@@ -158,6 +170,16 @@ def show_admin_main_menu(message):
     markup.add(btn1, btn2, btn3, btn4, btn5)
     bot.send_message(message.chat.id, "🚀 Работа начата!\n\nВыберите действие ниже.", reply_markup=markup)
 
+def show_admin_main_menu_by_user_id(user_id):
+    markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
+    btn1 = types.KeyboardButton('➕ Добавить номера')
+    btn2 = types.KeyboardButton('📊 Профиль')
+    btn3 = types.KeyboardButton('📋 Добавленные номера')
+    btn4 = types.KeyboardButton('⏹️ Закончить работу')
+    btn5 = types.KeyboardButton('🔧 Войти в админ панель')
+    markup.add(btn1, btn2, btn3, btn4, btn5)
+    bot.send_message(user_id, "🚀 Работа начата!\n\nВыберите действие ниже.", reply_markup=markup)
+
 @bot.message_handler(func=lambda message: message.text == '🔧 Войти в админ панель')
 def admin_panel(message):
     user_id = message.from_user.id
@@ -165,6 +187,16 @@ def admin_panel(message):
         show_admin_panel(message)
     else:
         bot.send_message(message.chat.id, "У вас нет доступа к админ панели.")
+
+@bot.message_handler(func=lambda message: message.text == '🔙 Выйти из админ панели')
+def handle_exit_admin_panel(message):
+    user_id = message.from_user.id
+    user_roles = db.fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
+    if user_roles and 'admin' in user_roles[0].split(','):
+        show_admin_main_menu(message)
+    else:
+        show_main_menu(message)
+
 
 def show_admin_panel(message):
     markup = types.ReplyKeyboardMarkup(row_width=1, resize_keyboard=True)
@@ -201,13 +233,43 @@ def list_admins(message):
 
 @bot.message_handler(func=lambda message: message.text == '👥 Список работников')
 def list_workers(message):
+    if not db.can_access_worker_list(message.from_user.id):
+        bot.send_message(message.chat.id, "У вас нет прав на просмотр этого списка.")
+        return
+
     workers = db.fetch_all("SELECT user_id, username FROM users WHERE roles LIKE '%worker%'")
     response = "Список работников:\n\n"
     markup = types.InlineKeyboardMarkup()
     for worker in workers:
         response += f"@{worker[1]} (ID: {worker[0]})\n"
         markup.add(types.InlineKeyboardButton(f"Удалить @{worker[1]}", callback_data=f"remove_worker_{worker[0]}"))
+    markup.add(types.InlineKeyboardButton('➕ Добавить', callback_data='add_worker'))
     bot.send_message(message.chat.id, response, reply_markup=markup)
+
+
+
+@bot.callback_query_handler(func=lambda call: call.data == 'add_worker')
+def add_worker(call):
+    msg = bot.send_message(call.message.chat.id, "Введите ID пользователя для добавления в работники:")
+    bot.register_next_step_handler(msg, process_add_worker)
+
+def process_add_worker(message):
+    try:
+        user_id = int(message.text)
+        add_role(user_id, 'worker')
+        bot.send_message(message.chat.id, f"Пользователь с ID {user_id} добавлен в работники.")
+        show_main_menu_by_user_id(user_id)
+    except ValueError:
+        bot.send_message(message.chat.id, "Пожалуйста, введите корректный ID пользователя.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('remove_worker_'))
+def remove_worker(call):
+    user_id = int(call.data.split('_')[2])
+    remove_role(user_id, 'worker')
+    bot.send_message(call.message.chat.id, f"Пользователь с ID {user_id} удален из работников.")
+    list_workers(call.message)
+
 
 @bot.callback_query_handler(func=lambda call: call.data == 'add_admin')
 def add_admin(call):
@@ -219,8 +281,11 @@ def process_add_admin(message):
         user_id = int(message.text)
         add_role(user_id, 'admin')
         bot.send_message(message.chat.id, f"Пользователь с ID {user_id} добавлен в администраторы.")
+        # Обновляем меню пользователя для доступа в админ панель
+        show_admin_main_menu_by_user_id(user_id)
     except ValueError:
         bot.send_message(message.chat.id, "Пожалуйста, введите корректный ID пользователя.")
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('remove_admin_'))
 def remove_admin(call):
@@ -242,7 +307,12 @@ def start_work(message):
     if user_id not in user_data:
         user_data[user_id] = {'whatsapp': [], 'telegram': [], 'start_time': None, 'sms_requests': {}}
     user_data[user_id]['start_time'] = datetime.datetime.now()
-    show_main_menu(message)
+
+    user_roles = db.fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
+    if user_roles and 'admin' in user_roles[0].split(','):
+        show_admin_main_menu(message)
+    else:
+        show_main_menu(message)
 
 @bot.message_handler(func=lambda message: message.text == '➕ Добавить номера')
 def add_numbers(message):
@@ -402,6 +472,7 @@ def remove_numbers(message):
         db.execute_query("DELETE FROM numbers WHERE number = ?", (number,))
         bot.send_message(message.chat.id, f"Номер {number} удален из базы данных.")
 
+
 @bot.message_handler(func=lambda message: message.text.lower() in ['вотс', 'телега'])
 def handle_purchase(message):
     service = 'whatsapp' if message.text.lower() == 'вотс' else 'telegram'
@@ -421,15 +492,15 @@ def handle_purchase(message):
         markup.add(
             types.InlineKeyboardButton('Запросить СМС', callback_data=f'request_sms_{number}'),
             types.InlineKeyboardButton('Замена', callback_data=f'replace_number_{number}'),
-            types.InlineKeyboardButton('❌Слёт', callback_data=f'decrement_counter_{number}')
         )
         bot.send_message(message.chat.id, f"<b>Номер:</b> <a href='tel:{number}'>{number}</a>", reply_markup=markup)
         bot.send_message(user_id, f"Номер {number} был выдан пользователю {message.from_user.username}.")
         db.increment_counter()
         db.update_stats(service, success=False)
-        Timer(600, finalize_number_status, args=(number, message)).start()
+        Timer(600, finalize_number_status, args=(number, message.chat.id, message.message_id)).start()
     else:
         bot.send_message(message.chat.id, f"Нет доступных номеров для {service.capitalize()}.")
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('request_sms_'))
 def request_sms(call):
@@ -458,7 +529,11 @@ def receive_sms(message, number):
         if issued_to:
             issued_to = issued_to[0]
             response = f"Номер: <a href='tel:{number}'>{number}</a>\n<b>SMS:</b> {message.text}\n+{db.get_counter()}"
-            bot.send_message(config.GROUP_ID, response)
+            markup = types.InlineKeyboardMarkup(row_width=1)
+            decrement_button = types.InlineKeyboardButton('❌Слёт', callback_data=f'decrement_counter_{number}')
+            markup.add(decrement_button)
+            sent_msg = bot.send_message(config.GROUP_ID, response, reply_markup=markup)
+            Timer(100, deactivate_decrement_button, args=(config.GROUP_ID, sent_msg.message_id, number)).start()
             del user_data[user_id]['sms_requests'][number]
         else:
             bot.send_message(message.chat.id, "Запрос на получение СМС по этому номеру не найден.")
@@ -487,12 +562,12 @@ def replace_number(call):
             markup = types.InlineKeyboardMarkup(row_width=1)
             sms_button = types.InlineKeyboardButton('Запросить СМС', callback_data=f'request_sms_{new_number}')
             replace_button = types.InlineKeyboardButton('Замена', callback_data=f'replace_number_{new_number}')
-            decrement_button = types.InlineKeyboardButton('❌Слёт', callback_data=f'decrement_counter_{new_number}')
-            markup.add(sms_button, replace_button, decrement_button)
+            markup.add(sms_button, replace_button)
             bot.edit_message_text(f"Новый номер: <a href='tel:{new_number}'>{new_number}</a>", call.message.chat.id, call.message.message_id, reply_markup=markup)
         else:
             bot.send_message(call.message.chat.id, "Нет доступных номеров для замены.")
     bot.answer_callback_query(call.id)
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('cancel_sms_'))
 def cancel_sms(call):
@@ -514,15 +589,6 @@ def decrement_counter_handler(call):
     db.execute_query("DELETE FROM numbers WHERE number = ?", (number,))
     bot.send_message(call.message.chat.id, f"Номер {number} слетел. Счетчик уменьшен.")
     bot.answer_callback_query(call.id)
-
-def finalize_number_status(number, message):
-    number_info = db.fetch_one("SELECT success FROM numbers WHERE number = ?", (number,))
-    if number_info and number_info[0] == 0:
-        bot.send_message(message.chat.id, f"Номер {number} не был подтвержден в течение 10 минут и считается слетевшим.")
-        db.execute_query("DELETE FROM numbers WHERE number = ?", (number,))
-    else:
-        db.mark_successful(number)
-        bot.send_message(message.chat.id, f"Номер {number} успешно подтвержден и добавлен в удачные.")
 
 def auto_clear():
     while True:
@@ -595,22 +661,29 @@ def admin_stats(message):
     else:
         bot.send_message(message.chat.id, "У вас нет прав на просмотр этой информации.")
 
-@bot.message_handler(commands=['removeworker'])
-def remove_worker(message):
-    if str(message.from_user.id) != config.ADMIN_ID:
-        bot.send_message(message.chat.id, "У вас нет прав на выполнение этой команды.")
-        return
+@bot.callback_query_handler(func=lambda call: call.data.startswith('decrement_counter_'))
+def decrement_counter_handler(call):
+    number = call.data.split('_')[2]
+    db.decrement_counter()
+    db.execute_query("DELETE FROM numbers WHERE number = ?", (number,))
+    bot.send_message(call.message.chat.id, f"Номер {number} слетел. Счетчик уменьшен.")
+    bot.answer_callback_query(call.id)
 
-    try:
-        user_id = int(message.text.split()[1])
-        db.execute_query("DELETE FROM users WHERE user_id = ?", (user_id,))
-        db.execute_query("DELETE FROM requests WHERE user_id = ?", (user_id,))
-        db.execute_query("DELETE FROM numbers WHERE user_id = ?", (user_id,))
-        db.execute_query("DELETE FROM numbers WHERE issued_to = ?", (user_id,))
-        bot.send_message(message.chat.id, f"Пользователь с ID {user_id} удален из списка работников.")
-        bot.send_message(user_id, "Ваш доступ к функционалу бота был отозван. Пожалуйста, подайте заявку на вступление.")
-    except (IndexError, ValueError):
-        bot.send_message(message.chat.id, "Пожалуйста, укажите корректный ID пользователя после команды /removeworker.")
+def finalize_number_status(number, chat_id, message_id):
+    number_info = db.fetch_one("SELECT success FROM numbers WHERE number = ?", (number,))
+    if number_info and number_info[0] == 0:  # Только если номер еще не успешный
+        db.mark_successful(number)
+        bot.send_message(chat_id, f"Номер {number} успешно подтвержден и добавлен в удачные.")
+        bot.edit_message_reply_markup(chat_id, message_id, reply_markup=None)
+
+
+def deactivate_decrement_button(chat_id, message_id, number):
+    markup = types.InlineKeyboardMarkup()
+    btn = types.InlineKeyboardButton('❌Слёт (неактивна)', callback_data=f'decrement_counter_{number}', disable_web_page_preview=True)
+    markup.add(btn)
+    bot.edit_message_reply_markup(chat_id, message_id, reply_markup=markup)
+    finalize_number_status(number, chat_id, message_id)
+
 
 def signal_handler(signal, frame):
     print('Остановка бота...')

@@ -1,3 +1,5 @@
+# database.py
+
 import sqlite3
 import datetime
 
@@ -16,7 +18,8 @@ def init_db():
                 username TEXT,
                 status TEXT,
                 last_request_time DATETIME,
-                roles TEXT)''')  # Добавлен столбец roles
+                roles TEXT,
+                earnings REAL DEFAULT 0)''')  # Добавлен столбец earnings
     
     # Создание таблицы requests
     c.execute('''CREATE TABLE IF NOT EXISTS requests (
@@ -125,10 +128,12 @@ def get_stats():
     return stats if stats else (date, 0, 0, 0, 0)
 
 def mark_successful(number):
-    execute_query("UPDATE numbers SET success = 1 WHERE number = ?", (number,))
-    number_info = fetch_one("SELECT service FROM numbers WHERE number = ?", (number,))
-    if number_info:
-        service = number_info[0]
+    service_info = fetch_one("SELECT service, issued_to FROM numbers WHERE number = ?", (number,))
+    if service_info:
+        service, issued_to = service_info
+        earnings = 3.2 if service == 'whatsapp' else 1.8
+        execute_query("UPDATE numbers SET success = 1 WHERE number = ?", (number,))
+        execute_query("UPDATE users SET earnings = earnings + ? WHERE user_id = ?", (earnings, issued_to))
         update_stats(service, success=True)
 
 def is_admin(user_id):
@@ -136,10 +141,18 @@ def is_admin(user_id):
     return user and 'admin' in user[0].split(',')
 
 def can_access_admin_panel(user_id):
+    if str(user_id) == ADMIN_ID:
+        return True
     return is_admin(user_id)
 
 def can_access_admin_list(user_id):
     return str(user_id) == ADMIN_ID
+
+def can_access_worker_list(user_id):
+    roles = fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
+    if roles and 'admin' in roles[0].split(','):
+        return True
+    return False
 
 def store_daily_stats():
     today = datetime.date.today()
