@@ -136,8 +136,6 @@ def is_admin(user_id):
     return user and 'admin' in user[0].split(',')
 
 def can_access_admin_panel(user_id):
-    if str(user_id) == ADMIN_ID:
-        return True
     return is_admin(user_id)
 
 def can_access_admin_list(user_id):
