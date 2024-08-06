@@ -357,11 +357,6 @@ def choose_service(call):
     msg = bot.send_message(call.message.chat.id, f"Введите список номеров для {service.capitalize()} в формате 9123456789, каждый номер с новой строки:")
     bot.register_next_step_handler(msg, process_numbers, service)
     show_back_button(call.message)
-
-def process_numbers(message, service):
-    user_id = message.from_user.id
-    if user_id not in user_data:
-        user_data[user_id] = {'whatsapp': [], 'telegram': [], 'start_time': None, 'sms_requests': {}}
     
 def process_numbers(message, service):
     user_id = message.from_user.id
@@ -387,13 +382,10 @@ def process_numbers(message, service):
 
     user_data[user_id][service].extend(valid_numbers)
 
-    queue_data = db.fetch_all("SELECT number FROM numbers WHERE service = ? AND issued_to IS NULL", (service,))
-    queue_numbers = [entry[0] for entry in queue_data]
     for number in valid_numbers:
-        if number['number'] not in queue_numbers:
-            db.execute_query("INSERT INTO numbers (number, service, user_id, add_date, add_time) VALUES (?, ?, ?, ?, ?)",
-                             (number['number'], service, user_id, number['timestamp'].date(), number['timestamp'].time().strftime('%H:%M:%S')))
-
+        db.execute_query("INSERT INTO numbers (number, service, user_id, add_date, add_time) VALUES (?, ?, ?, ?, ?)",
+                         (number['number'], service, user_id, number['timestamp'].date(), number['timestamp'].time().strftime('%H:%M:%S')))
+    
     response = f"✅ Обработка номеров {service.capitalize()} завершена!\n\n"
     response += f"➕ Добавлено записей: {len(valid_numbers)}\n"
     response += f"❌ Не удалось распознать: {invalid_numbers}\n"
@@ -449,40 +441,110 @@ def show_added_numbers(message):
 
 def show_numbers_page(message, user_id, page):
     markup = types.InlineKeyboardMarkup()
-    numbers = user_data[user_id]['whatsapp'] + user_data[user_id]['telegram']
+    numbers = db.fetch_all("SELECT number_id, number, add_date, add_time, service FROM numbers WHERE user_id = ?", (user_id,))
     start_index = page * 4
     end_index = start_index + 4
     numbers_page = numbers[start_index:end_index]
 
     for entry in numbers_page:
-        number = entry['number']
-        timestamp = entry['timestamp']
-        service = "🟢" if number in [num['number'] for num in user_data[user_id]['whatsapp']] else "🔵"
-        btn_text = f"{service} {timestamp.strftime('%Y-%m-%d %H:%M')} - {number}"
-        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"delete_{number}_{timestamp.strftime('%Y%m%d%H%M')}"))
+        number_id = entry[0]
+        number = entry[1]
+        timestamp = f"{entry[2]} {entry[3]}"
+        service = entry[4]  # Получаем значение service из базы данных
+
+        # Добавляем эмодзи в зависимости от service
+        service_emoji = "🟢" if service == "whatsapp" else "🔵" 
+
+        btn_text = f"{service_emoji} {timestamp} - {number}"
+        markup.add(types.InlineKeyboardButton(btn_text, callback_data=f"confirm_delete_{number_id}"))
 
     if start_index > 0:
         markup.add(types.InlineKeyboardButton('⬅️ Назад', callback_data=f'prev_page_{page-1}'))
-    if end_index < len(numbers):
+    if end_index < len(numbers):    
         markup.add(types.InlineKeyboardButton('➡️ Вперед', callback_data=f'next_page_{page+1}'))
 
     markup.add(types.InlineKeyboardButton('🔙 Назад', callback_data='go_back'))
     bot.send_message(message.chat.id, "Ваши номера:", reply_markup=markup)
 
-@bot.callback_query_handler(func=lambda call: call.data.startswith('delete_'))
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('confirm_delete_'))
+def confirm_delete_number(call):
+    number_id = call.data.split('_')[2]
+    markup = types.InlineKeyboardMarkup()
+    btn_yes = types.InlineKeyboardButton('Да', callback_data=f'delete_number_{number_id}')
+    btn_no = types.InlineKeyboardButton('Нет', callback_data='cancel_delete')
+    markup.add(btn_yes, btn_no)
+    bot.send_message(call.message.chat.id, f"Вы точно хотите удалить номер с ID {number_id} из очереди?", reply_markup=markup)
+    bot.answer_callback_query(call.id)
+
+def print_numbers_table():
+    rows = db.fetch_all("SELECT * FROM numbers")
+    for row in rows:
+        print(row)
+
+def delete_number_entry(number, add_date, add_time):
+    print(f"Deleting number {number} with add_date {add_date} and add_time {add_time}")
+    db.execute_query("DELETE FROM numbers WHERE number = ? AND add_date = ? AND add_time = ?", (number, add_date, add_time))
+    # Verify if the number is deleted
+    result = db.fetch_one("SELECT * FROM numbers WHERE number = ? AND add_date = ? AND add_time = ?", (number, add_date, add_time))
+    if result:
+        print(f"Number {number} still exists in the database: {result}")
+    else:
+        print(f"Number {number} successfully deleted from the database.")
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('delete_number_'))
 def delete_number(call):
-    _, number, timestamp = call.data.split('_', 2)
-    timestamp = datetime.datetime.strptime(timestamp, '%Y%m%d%H%M')
-    user_id = call.from_user.id
-    for service in ['whatsapp', 'telegram']:
-        for entry in user_data[user_id][service]:
-            if entry['number'] == number and entry['timestamp'] == timestamp:
-                user_data[user_id][service].remove(entry)
-                db.execute_query("DELETE FROM numbers WHERE number = ?", (number,))
-                bot.send_message(user_id, f"Номер {number} удален из очереди!")
-                bot.edit_message_text("Ваши номера:", call.message.chat.id, call.message.message_id, reply_markup=None)
-                show_numbers_page(call.message, user_id, 0)
-                return
+    try:
+        number_id = call.data.split('_')[2]
+        user_id = call.from_user.id
+
+        # Проверяем, что номер принадлежит пользователю
+        number_data = db.fetch_one("SELECT user_id FROM numbers WHERE number_id = ?", (number_id,))
+        if number_data:
+            print(f"Number data found: {number_data}")  # Debugging information
+            if number_data[0] == user_id:
+                # Удаление номера из базы данных
+                db.execute_query("DELETE FROM numbers WHERE number_id = ?", (number_id,))
+                
+                # Проверка успешности удаления
+                remaining_number = db.fetch_one("SELECT * FROM numbers WHERE number_id = ?", (number_id,))
+                if remaining_number:
+                    print(f"Number with ID {number_id} was not deleted from database. Remaining number: {remaining_number}")
+                else:
+                    print(f"Number with ID {number_id} successfully deleted from database")
+                
+                # Уведомление пользователя
+                bot.send_message(user_id, f"Номер с ID {number_id} успешно удалён из очереди!")
+                
+                # Обновление сообщения с кнопками номеров
+                message_id = call.message.message_id
+                markup = call.message.reply_markup
+                new_markup = types.InlineKeyboardMarkup()
+                
+                for row in markup.inline_keyboard:
+                    new_row = []
+                    for button in row:
+                        if f'confirm_delete_{number_id}' not in button.callback_data:
+                            new_row.append(button)
+                    if new_row:
+                        new_markup.add(*new_row)
+                
+                bot.edit_message_reply_markup(call.message.chat.id, message_id, reply_markup=new_markup)
+            else:
+                print(f"User {user_id} does not own number {number_id}")  # Debugging information
+                bot.send_message(user_id, "Вы не можете удалить этот номер, так как он вам не принадлежит.")
+        else:
+            print(f"No number data found for number ID {number_id}")  # Debugging information
+            bot.send_message(user_id, "Номер не найден.")
+    except Exception as e:
+        print(f"Error in delete_number: {e}")
+    bot.answer_callback_query(call.id)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'cancel_delete')
+def cancel_delete(call):
+    bot.send_message(call.message.chat.id, "Удаление отменено.")
+    show_numbers_page(call.message, call.from_user.id, 0)
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('prev_page_') or call.data.startswith('next_page_'))
 def handle_pagination(call):
@@ -501,10 +563,18 @@ def end_work(message):
     user_data[user_id]['whatsapp'] = []
     user_data[user_id]['telegram'] = []
 
-    db.remove_numbers_by_user(user_id)
+    # Удаление всех номеров пользователя из базы данных
+    db.execute_query("DELETE FROM numbers WHERE user_id = ?", (user_id,))
     
     bot.send_message(message.chat.id, "⏹️ Работа завершена. Все ваши номера удалены из очереди.")
+    
+    # Обновление сообщения с кнопками номеров
+    remove_all_number_buttons(message)
 
+def remove_all_number_buttons(message):
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton('🔙 Назад', callback_data='go_back'))
+    bot.edit_message_reply_markup(message.chat.id, message.message_id, reply_markup=markup)
 
 @bot.message_handler(commands=['rm'])
 def remove_numbers(message):
@@ -543,8 +613,10 @@ def handle_purchase(message):
         bot.send_message(message.chat.id, f"Нет доступных номеров для {service.capitalize()}.")
 
 def return_number_to_queue(number, chat_id):
-    db.execute_query("UPDATE numbers SET issued_to = NULL, issued_time = NULL WHERE number = ? AND success = 0", (number,))
-    bot.send_message(chat_id, f"Время на запрос СМС истекло. Номер {number} возвращен в очередь.")
+    success = db.fetch_one("SELECT success FROM numbers WHERE number = ?", (number,))
+    if success and success[0] == 0:
+        db.execute_query("UPDATE numbers SET issued_to = NULL, issued_time = NULL WHERE number = ? AND success = 0", (number,))
+        bot.send_message(chat_id, f"Время на запрос СМС истекло. Номер {number} возвращен в очередь.")
 
 def replace_number_after_timeout(message, number, worker_id):
     issued_to = db.fetch_one("SELECT issued_to FROM numbers WHERE number = ? AND success = 0", (number,))
@@ -577,32 +649,43 @@ def replace_number_after_timeout(message, number, worker_id):
 def request_sms(call):
     number = call.data.split('_')[2]
     user_id = call.from_user.id
+    
     if user_id not in request_tracker:
         request_tracker[user_id] = []
+    
     if number in request_tracker[user_id]:
         bot.answer_callback_query(call.id, "Вы уже запрашивали СМС для этого номера.", show_alert=True)
         return
+    
     request_tracker[user_id].append(number)
 
     worker_id = db.fetch_one("SELECT user_id FROM numbers WHERE number = ?", (number,))
+    
     if worker_id:
         worker_id = worker_id[0]
         request_msg = bot.send_message(worker_id, f"Запрошен СМС по номеру {number}. Пришлите смс ответом на это сообщение.", reply_markup=worker_sms_markup(number))
+        
         if worker_id not in user_data:
             user_data[worker_id] = {'whatsapp': [], 'telegram': [], 'start_time': None, 'sms_requests': {}}
+        
         if number not in user_data[worker_id]['sms_requests']:
             user_data[worker_id]['sms_requests'][number] = []
+        
         user_data[worker_id]['sms_requests'][number].append(request_msg.message_id)
+        
         bot.register_next_step_handler(request_msg, lambda message: receive_sms(message, number))
         
-        Timer(120, replace_number_after_timeout, args=(call.message, number, worker_id)).start()
-    
-    bot.send_message(call.message.chat.id, f"Запрос на получение СМС по номеру <a href='tel:{number}'>{number}</a> отправлен.")
-    
-    markup = types.InlineKeyboardMarkup(row_width=1)
-    markup.add(types.InlineKeyboardButton('Запросить СМС (неактивно)', callback_data=f'request_sms_{number}', disable_web_page_preview=True))
-    markup.add(types.InlineKeyboardButton('Замена', callback_data=f'replace_number_{number}'))
-    bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
+        # Таймер для возврата номера в очередь при истечении времени
+        timer = Timer(120, return_number_to_queue, args=(number, call.message.chat.id))
+        timer.start()
+        
+        bot.send_message(call.message.chat.id, f"Запрос на получение СМС по номеру <a href='tel:{number}'>{number}</a> отправлен.")
+        
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(types.InlineKeyboardButton('Запросить СМС (неактивно)', callback_data=f'request_sms_{number}', disable_web_page_preview=True))
+        markup.add(types.InlineKeyboardButton('Замена', callback_data=f'replace_number_{number}'))
+        
+        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
     bot.answer_callback_query(call.id)
 
 def worker_sms_markup(number):
@@ -637,6 +720,7 @@ def receive_sms(message, number):
         bot.send_message(message.chat.id, "Запрос на получение СМС по этому номеру не найден.")
 
 
+@bot.callback_query_handler(func=lambda call: call.data.startswith('replace_number_'))
 def replace_number(call):
     number = call.data.split('_')[2]
     service_data = db.fetch_one("SELECT service FROM numbers WHERE number = ?", (number,))
@@ -644,25 +728,33 @@ def replace_number(call):
         service = service_data[0]
         queue_data = db.fetch_all("SELECT number FROM numbers WHERE service = ? AND issued_to IS NULL", (service,))
         queue_numbers = [entry[0] for entry in queue_data if entry[0] not in recently_issued_numbers.get(service, [])]
+        
         if not queue_numbers:
             queue_numbers = [entry[0] for entry in queue_data]
             recently_issued_numbers[service] = []
+        
         if queue_numbers:
             new_number = random.choice(queue_numbers)
             recently_issued_numbers[service].append(new_number)
+            
             if len(recently_issued_numbers[service]) > len(queue_data):
                 recently_issued_numbers[service].pop(0)
-            db.execute_query("UPDATE numbers SET issued_to = ?, issued_time = ? WHERE number = ?",
+                
+            db.execute_query("UPDATE numbers SET issued_to = ?, issued_time = ? WHERE number = ?", 
                              (call.from_user.id, datetime.datetime.now(), new_number))
             db.execute_query("UPDATE numbers SET issued_to = NULL, issued_time = NULL WHERE number = ?", (number,))
+            
             markup = types.InlineKeyboardMarkup(row_width=1)
             sms_button = types.InlineKeyboardButton('Запросить СМС', callback_data=f'request_sms_{new_number}')
             replace_button = types.InlineKeyboardButton('Замена', callback_data=f'replace_number_{new_number}')
             markup.add(sms_button, replace_button)
-            bot.edit_message_text(f"Новый номер: <a href='tel:{new_number}'>{new_number}</a>", call.message.chat.id, call.message.message_id, reply_markup=markup)
+            
+            bot.edit_message_text(f"Новый номер: <a href='tel:{new_number}'>{new_number}</a>", 
+                                  call.message.chat.id, call.message.message_id, reply_markup=markup)
         else:
             bot.send_message(call.message.chat.id, "Нет доступных номеров для замены.")
     bot.answer_callback_query(call.id)
+
 
 @bot.callback_query_handler(func=lambda call: call.data.startswith('cancel_sms_'))
 def cancel_sms(call):

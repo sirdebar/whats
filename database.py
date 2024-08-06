@@ -3,7 +3,7 @@
 import sqlite3
 import datetime
 
-ADMIN_ID = '6446169411'
+ADMIN_ID = '596966683'
 
 def init_db():
     conn = sqlite3.connect('bot_database.db')
@@ -74,18 +74,31 @@ def init_db():
     
     c.execute("INSERT OR IGNORE INTO prices (service, price) VALUES ('whatsapp', 3.2), ('telegram', 1.8)")
     
-
     conn.commit()
     conn.close()
 
 # Остальные функции (execute_query, fetch_all, fetch_one, reset_counter и т.д.) остаются без изменений
 
 def execute_query(query, params=()):
-    conn = sqlite3.connect('bot_database.db')
-    c = conn.cursor()
-    c.execute(query, params)
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect('bot_database.db')
+        c = conn.cursor()
+        c.execute(query, params)
+        conn.commit()
+        print(f"Executed query: {query} with params: {params}")  # Debugging information
+        conn.close()
+    except sqlite3.Error as e:
+        print(f"Database error: {e}")  # Debugging information
+
+def delete_number_entry(number, add_date, add_time):
+    print(f"Deleting number {number} with add_date {add_date} and add_time {add_time}")
+    db.execute_query("DELETE FROM numbers WHERE number = ? AND add_date = ? AND add_time = ?", (number, add_date, add_time))
+    # Verify if the number is deleted
+    result = db.fetch_one("SELECT * FROM numbers WHERE number = ? AND add_date = ? AND add_time = ?", (number, add_date, add_time))
+    if result:
+        print(f"Number {number} still exists in the database: {result}")
+    else:
+        print(f"Number {number} successfully deleted from the database.")
 
 def fetch_all(query, params=()):
     conn = sqlite3.connect('bot_database.db')
