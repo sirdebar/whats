@@ -68,6 +68,13 @@ def init_db():
     c.execute("INSERT OR IGNORE INTO users (user_id, username, status, roles) VALUES (?, ?, ?, ?)",
               (ADMIN_ID, 'main_admin', 'approved', 'admin'))
 
+    c.execute('''CREATE TABLE IF NOT EXISTS prices (
+                service TEXT PRIMARY KEY,
+                price REAL)''')
+    
+    c.execute("INSERT OR IGNORE INTO prices (service, price) VALUES ('whatsapp', 3.2), ('telegram', 1.8)")
+    
+
     conn.commit()
     conn.close()
 
@@ -109,6 +116,13 @@ def get_counter():
     row = fetch_one("SELECT count FROM counter WHERE id = 1")
     return row[0] if row else 0
 
+def get_price(service):
+    row = fetch_one("SELECT price FROM prices WHERE service = ?", (service,))
+    return row[0] if row else None
+
+def update_price(service, new_price):
+    execute_query("UPDATE prices SET price = ? WHERE service = ?", (new_price, service))
+
 def update_stats(service, success):
     date = datetime.date.today()
     stats = fetch_one("SELECT * FROM stats WHERE date = ?", (date,))
@@ -141,10 +155,11 @@ def mark_successful(number):
     service_info = fetch_one("SELECT service, issued_to FROM numbers WHERE number = ?", (number,))
     if service_info:
         service, issued_to = service_info
-        earnings = 3.2 if service == 'whatsapp' else 1.8
+        earnings = get_price(service)
         execute_query("UPDATE numbers SET success = 1 WHERE number = ?", (number,))
         execute_query("UPDATE users SET earnings = earnings + ? WHERE user_id = ?", (earnings, issued_to))
         update_stats(service, success=True)
+
 
 def is_admin(user_id):
     user = fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))

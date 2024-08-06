@@ -19,6 +19,30 @@ recently_issued_numbers = {}
 sms_requests = {}
 request_tracker = {}  
 
+@bot.message_handler(func=lambda message: message.text == 'Изменить цену')
+def change_price(message):
+    markup = types.InlineKeyboardMarkup()
+    btn1 = types.InlineKeyboardButton('WhatsApp', callback_data='change_price_whatsapp')
+    btn2 = types.InlineKeyboardButton('Telegram', callback_data='change_price_telegram')
+    markup.add(btn1, btn2)
+    bot.send_message(message.chat.id, "Выберите:", reply_markup=markup)
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('change_price_'))
+def select_service_to_change_price(call):
+    service = call.data.split('_')[-1]
+    current_price = db.get_price(service)
+    msg = bot.send_message(call.message.chat.id, f"Актуальная цена {current_price}$ за {service.capitalize()}. Введите новую цену:")
+    bot.register_next_step_handler(msg, process_new_price, service)
+
+def process_new_price(message, service):
+    try:
+        new_price = float(message.text)
+        db.update_price(service, new_price)
+        bot.send_message(message.chat.id, f"Цена за {service.capitalize()} успешно обновлена на {new_price}$")
+    except ValueError:
+        bot.send_message(message.chat.id, "Пожалуйста, введите корректное число.")
+        change_price(message)
+
 def retry_request(func, *args, retries=3, delay=2, **kwargs):
     for attempt in range(retries):
         try:
@@ -204,8 +228,9 @@ def show_admin_panel(message):
     btn1 = types.KeyboardButton('📊 Статистика')
     btn2 = types.KeyboardButton('👥 Список администраторов')
     btn3 = types.KeyboardButton('👥 Список работников')
-    btn4 = types.KeyboardButton('🔙 Выйти из админ панели')
-    markup.add(btn1, btn2, btn3, btn4)
+    btn4 = types.KeyboardButton('Изменить цену')
+    btn5 = types.KeyboardButton('🔙 Выйти из админ панели')
+    markup.add(btn1, btn2, btn3, btn4, btn5)
     bot.send_message(message.chat.id, "🔧 Админ панель", reply_markup=markup)
 
 @bot.message_handler(func=lambda message: message.text == '📊 Статистика')
@@ -377,8 +402,6 @@ def process_numbers(message, service):
     bot.send_message(message.chat.id, response)
     show_back_button(message)
 
-
-
 @bot.message_handler(func=lambda message: message.text == '📊 Профиль')
 def show_profile(message):
     user_id = message.from_user.id
@@ -390,8 +413,11 @@ def show_profile(message):
     whatsapp_success, whatsapp_total = stats[1], stats[2]
     telegram_success, telegram_total = stats[3], stats[4]
 
-    whatsapp_earnings = whatsapp_success * 3.2
-    telegram_earnings = telegram_success * 1.8
+    whatsapp_price = db.get_price('whatsapp')
+    telegram_price = db.get_price('telegram')
+
+    whatsapp_earnings = whatsapp_success * whatsapp_price
+    telegram_earnings = telegram_success * telegram_price
 
     response = f"🧸 Вы {message.from_user.username}\n"
     response += f"Статистика за {datetime.date.today().strftime('%d-%m-%Y')}\n"
@@ -547,7 +573,6 @@ def replace_number_after_timeout(message, number, worker_id):
             else:
                 bot.send_message(issued_to, f"Нет доступных номеров для {service.capitalize()} для замены.")
 
-
 @bot.callback_query_handler(func=lambda call: call.data.startswith('request_sms_'))
 def request_sms(call):
     number = call.data.split('_')[2]
@@ -579,8 +604,6 @@ def request_sms(call):
     markup.add(types.InlineKeyboardButton('Замена', callback_data=f'replace_number_{number}'))
     bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=markup)
     bot.answer_callback_query(call.id)
-
-
 
 def worker_sms_markup(number):
     markup = types.InlineKeyboardMarkup(row_width=1)
