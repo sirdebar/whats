@@ -708,7 +708,7 @@ def receive_sms(message, number):
                     decrement_button = types.InlineKeyboardButton('❌Слёт', callback_data=f'decrement_counter_{number}')
                     markup.add(decrement_button)
                     sent_msg = bot.send_message(config.GROUP_ID, response, reply_markup=markup)
-                    Timer(100, deactivate_decrement_button, args=(config.GROUP_ID, sent_msg.message_id, number)).start()
+                    Timer(600, deactivate_decrement_button, args=(config.GROUP_ID, sent_msg.message_id, number)).start()
                     user_data[user_id]['sms_requests'][number].remove(request_msg_id)
                     if not user_data[user_id]['sms_requests'][number]:
                         del user_data[user_id]['sms_requests'][number]
