@@ -1,9 +1,7 @@
-# file: database.py
-
 import sqlite3
 import datetime
 
-ADMIN_ID = '596966683'
+ADMIN_ID = '1083294848'
 
 def init_db():
     conn = sqlite3.connect('bot_database.db')
