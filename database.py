@@ -33,6 +33,7 @@ def init_db():
                 issued_to INTEGER,
                 issued_time DATETIME,
                 success INTEGER DEFAULT 0,
+                failed INTEGER DEFAULT 0,
                 add_date DATE,
                 add_time TIME,
                 FOREIGN KEY(user_id) REFERENCES users(user_id))''')
@@ -163,14 +164,16 @@ def remove_numbers_by_user(user_id):
     execute_query("DELETE FROM numbers WHERE issued_to = ?", (user_id,))
 
 def mark_successful(number):
-    service_info = fetch_one("SELECT service, issued_to FROM numbers WHERE number = ?", (number,))
+    # Получаем информацию о сервисе и пользователе, которому выдан номер
+    service_info = fetch_one("SELECT service, issued_to, success FROM numbers WHERE number = ?", (number,))
     if service_info:
-        service, issued_to = service_info
-        earnings = get_price(service)
-        execute_query("UPDATE numbers SET success = 1 WHERE number = ?", (number,))
-        execute_query("UPDATE users SET earnings = earnings + ? WHERE user_id = ?", (earnings, issued_to))
-        update_stats(service, success=True)
-
+        service, issued_to, success_status = service_info
+        # Проверяем, был ли номер уже помечен как успешный
+        if success_status == 0: 
+            earnings = get_price(service)
+            execute_query("UPDATE numbers SET success = 1 WHERE number = ?", (number,))
+            execute_query("UPDATE users SET earnings = earnings + ? WHERE user_id = ?", (earnings, issued_to))
+            update_stats(service, success=True)
 
 def is_admin(user_id):
     user = fetch_one("SELECT roles FROM users WHERE user_id = ?", (user_id,))
