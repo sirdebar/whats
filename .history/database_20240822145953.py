@@ -124,10 +124,6 @@ def increment_counter():
 def decrement_counter():
     execute_query("UPDATE counter SET count = count - 1 WHERE id = 1")
 
-def get_service_by_number(number):
-    row = fetch_one("SELECT service FROM numbers WHERE number = ?", (number,))
-    return row[0] if row else None
-
 def get_counter():
     row = fetch_one("SELECT count FROM counter WHERE id = 1")
     return row[0] if row else 0
@@ -197,10 +193,6 @@ def can_access_worker_list(user_id):
         return True
     return False
 
-def get_worker_id_by_number(number):
-    row = fetch_one("SELECT issued_to FROM numbers WHERE number = ?", (number,))
-    return row[0] if row else None
-
 def store_daily_stats():
     today = datetime.date.today()
     yesterday = today - datetime.timedelta(days=1)
@@ -238,3 +230,5 @@ def test_access():
 init_db()
 init_weekly_stats()
 test_access()
+
+# end
